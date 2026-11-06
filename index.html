@@ -2,42 +2,56 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <title>Point & Explain</title>
 <style>
-  :root { --amber:#ffb000; --ink:#fff; --bg:#000; }
-  * { box-sizing:border-box; margin:0; padding:0; }
+  :root { --amber:#ffb000; --ink:#fff; --bg:#000; --mic:#ff3b30; }
+  * { box-sizing:border-box; margin:0; padding:0; -webkit-user-select:none; user-select:none; -webkit-touch-callout:none; }
   html, body { height:100%; background:var(--bg); color:var(--ink);
-    font-family:-apple-system, "SF Pro Text", system-ui, sans-serif; overflow:hidden; }
+    font-family:-apple-system, "SF Pro Text", system-ui, sans-serif; overflow:hidden; touch-action:none; }
   #stage { position:fixed; inset:0; }
   video, canvas { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; }
   #status { position:fixed; top:calc(env(safe-area-inset-top) + 14px); left:16px; right:16px;
     font-size:15px; font-weight:600; letter-spacing:.04em; text-transform:uppercase;
-    display:flex; align-items:center; gap:8px; text-shadow:0 1px 4px #000; }
+    display:flex; align-items:center; gap:8px; text-shadow:0 1px 4px #000; pointer-events:none; }
   #dot { width:10px; height:10px; border-radius:50%; background:#666; flex:none; }
   #dot.on { background:#3c3; } #dot.busy { background:var(--amber); animation:pulse .8s infinite alternate; }
+  #dot.mic { background:var(--mic); animation:pulse .4s infinite alternate; }
   @keyframes pulse { to { opacity:.3; } }
+  #heard { position:fixed; top:calc(env(safe-area-inset-top) + 42px); left:16px; right:16px;
+    font-size:20px; font-style:italic; color:#ddd; text-shadow:0 1px 4px #000; pointer-events:none; }
   #answer { position:fixed; left:16px; right:16px; bottom:calc(env(safe-area-inset-bottom) + 24px);
-    font-size:32px; line-height:1.15; font-weight:700; background:rgba(0,0,0,.72);
-    padding:18px 20px; border-radius:18px; border:2px solid var(--amber); display:none; }
+    font-size:28px; line-height:1.18; font-weight:700; background:rgba(0,0,0,.75);
+    padding:18px 20px; border-radius:18px; border:2px solid var(--amber); display:none;
+    max-height:50vh; overflow:hidden; pointer-events:none; }
+  #answer.read { font-size:22px; font-weight:600; }
+  #listening { position:fixed; inset:0; border:10px solid var(--mic); display:none; pointer-events:none; }
   #start { position:fixed; inset:0; display:flex; flex-direction:column; align-items:center;
-    justify-content:center; gap:22px; background:#000; z-index:5; padding:24px; text-align:center; }
-  #start h1 { font-size:40px; } #start p { font-size:18px; color:#bbb; max-width:320px; line-height:1.4; }
+    justify-content:center; gap:20px; background:#000; z-index:5; padding:24px; text-align:center; }
+  #start h1 { font-size:40px; }
+  #start ul { list-style:none; font-size:17px; color:#bbb; max-width:330px; line-height:1.45; text-align:left; }
+  #start li { margin:6px 0; } #start b { color:#fff; }
   #start button { font-size:26px; font-weight:700; padding:28px 0; width:100%; max-width:340px;
     border-radius:22px; border:none; background:var(--amber); color:#000; }
-  #foot { position:fixed; bottom:4px; width:100%; text-align:center; font-size:10px; color:#888; }
+  #foot { position:fixed; bottom:4px; width:100%; text-align:center; font-size:10px; color:#888; pointer-events:none; }
 </style>
 </head>
 <body>
 <div id="stage"><video id="cam" playsinline muted autoplay></video><canvas id="fx"></canvas></div>
+<div id="listening"></div>
 <div id="status"><span id="dot"></span><span id="statusText">Starting</span></div>
+<div id="heard"></div>
 <div id="answer" aria-live="polite"></div>
 
 <div id="start">
   <h1>Point &amp; Explain</h1>
-  <p>Hold the phone in one hand. Point at something with the other and hold still. You'll hear what it is.</p>
-  <button id="go" aria-label="Start. Tap anywhere later to describe what is straight ahead.">Tap to start</button>
+  <ul>
+    <li><b>Point</b> at something and hold still to hear what it is.</li>
+    <li><b>Hold the screen</b> and speak: "What's in front of me?", "Read this", or any question.</li>
+    <li><b>Tap</b> the screen to hear what's ahead.</li>
+  </ul>
+  <button id="go" aria-label="Start. Later, hold the screen to speak, or tap to describe what is ahead.">Tap to start</button>
 </div>
 <div id="foot">Prototype for IPD 5900 at Penn · not a mobility aid</div>
 
@@ -48,12 +62,14 @@ const HOLD_MS = 1000;      // finger must stay still this long
 const STILL_PX = 0.04;     // allowed jitter (fraction of frame width)
 const REACH = 1.6;         // how far past the fingertip the target sits (in finger-segment lengths)
 const COOLDOWN_MS = 3500;
+const PRESS_MS = 350;      // press longer than this = talk, shorter = tap
 
 const $ = id => document.getElementById(id);
 const video = $("cam"), cv = $("fx"), cx = cv.getContext("2d");
-let hands, actx, busy = false, lastSpoke = 0, holdStart = 0, anchor = null, lastTarget = null;
+let hands, actx, busy = false, listening = false, lastSpoke = 0, holdStart = 0, anchor = null;
 
 function status(t, cls) { $("statusText").textContent = t; $("dot").className = cls || ""; }
+function ready() { status("Point, tap, or hold to talk", "on"); }
 
 // ---------- audio ----------
 function tick(xNorm, freq = 880, dur = .05, vol = .25) {
@@ -65,78 +81,133 @@ function tick(xNorm, freq = 880, dur = .05, vol = .25) {
   o.connect(g).connect(p).connect(actx.destination); o.start(); o.stop(actx.currentTime + dur);
 }
 function side(x) { return x < .35 ? "On your left. " : x > .65 ? "On your right. " : "Ahead. "; }
-function say(text) {
+function say(text, rate = 1.05) {
   speechSynthesis.cancel();
-  const u = new SpeechSynthesisUtterance(text); u.rate = 1.05; u.lang = "en-US";
+  const u = new SpeechSynthesisUtterance(text); u.rate = rate; u.lang = "en-US";
   speechSynthesis.speak(u);
 }
-function show(text) { const a = $("answer"); a.textContent = text; a.style.display = "block"; }
+function show(text, isRead) {
+  const a = $("answer"); a.textContent = text; a.className = isRead ? "read" : ""; a.style.display = "block";
+}
 
 // ---------- camera + model ----------
-$("go").onclick = async () => {
+$("go").onclick = async e => {
+  e.stopPropagation();
   actx = new (window.AudioContext || window.webkitAudioContext)();
   say("Starting camera.");
   $("start").style.display = "none";
   try {
     const stream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
+      video: { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false });
     video.srcObject = stream; await video.play();
-  } catch (e) { status("Camera blocked"); say("I can't open the camera. Check Safari camera permission."); return; }
+  } catch (err) { status("Camera blocked"); say("I can't open the camera. Check Safari camera permission."); return; }
   status("Loading hand model", "busy");
   const fs = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
   hands = await HandLandmarker.createFromOptions(fs, {
     baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task", delegate: "GPU" },
     runningMode: "VIDEO", numHands: 1 });
-  status("Point at something", "on");
-  say("Ready. Point at something and hold still.");
+  ready();
+  say("Ready. Point at something, or hold the screen and ask.");
   loop();
 };
 
-// Tap anywhere = describe what's straight ahead (no hand needed)
-document.addEventListener("click", e => {
-  if ($("start").style.display !== "none" || !hands) return;
-  describe({ x: .5, y: .5 }, true);
-});
-// Desktop recording shortcut
-document.addEventListener("keydown", e => { if (e.key === "p" && hands) describe({ x: .5, y: .5 }, true); });
+// ---------- voice ----------
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+let rec = null, heard = "";
 
-// map normalized video coords -> on-screen coords (object-fit: cover)
+function startListening() {
+  if (!SR) { say("Voice input isn't available in this browser. Tap to describe instead."); return; }
+  if (busy) return;
+  speechSynthesis.cancel();
+  heard = ""; listening = true;
+  rec = new SR(); rec.lang = "en-US"; rec.interimResults = true; rec.continuous = true;
+  rec.onresult = ev => {
+    heard = [...ev.results].map(r => r[0].transcript).join(" ").trim();
+    $("heard").textContent = "“" + heard + "”";
+  };
+  rec.onerror = ev => {
+    if (ev.error === "not-allowed" || ev.error === "service-not-allowed")
+      say("I can't use the microphone. Allow it in Safari, and turn on Dictation in iPhone settings.");
+  };
+  rec.onend = () => { if (listening) finishListening(); };
+  try { rec.start(); } catch (err) {}
+  $("listening").style.display = "block"; $("heard").textContent = "";
+  status("Listening", "mic"); tick(.5, 520, .08, .3);
+}
+function finishListening() {
+  listening = false; $("listening").style.display = "none";
+  try { rec && rec.stop(); } catch (err) {}
+  // give the recognizer a moment to deliver the final words
+  setTimeout(() => {
+    const q = heard.trim();
+    if (!q) { ready(); say("I didn't catch that. Hold the screen and try again."); return; }
+    route(q);
+  }, 400);
+}
+function route(q) {
+  const s = q.toLowerCase();
+  if (/\bread\b|what does (it|this|that) say|what's written|text/.test(s)) return capture("read");
+  if (/(in front|ahead|around me|what do you see|what can you see|describe|where am i|what's there)/.test(s)) return capture("scene");
+  return capture("ask", q);
+}
+
+// ---------- press handling: short tap = scene, long press = talk ----------
+let pressTimer = null, pressed = false;
+function down(e) {
+  if ($("start").style.display !== "none" || !hands) return;
+  e.preventDefault(); pressed = true;
+  pressTimer = setTimeout(() => { pressTimer = null; startListening(); }, PRESS_MS);
+}
+function up(e) {
+  if (!pressed) return; pressed = false;
+  if (pressTimer) { clearTimeout(pressTimer); pressTimer = null; capture("scene"); }
+  else if (listening) finishListening();
+}
+document.addEventListener("pointerdown", down);
+document.addEventListener("pointerup", up);
+document.addEventListener("pointercancel", up);
+
+// Desktop recording shortcuts: p = scene, t = read, space (hold) = talk
+document.addEventListener("keydown", e => {
+  if (!hands || e.repeat) return;
+  if (e.key === "p") capture("scene");
+  if (e.key === "t") capture("read");
+  if (e.key === " ") { e.preventDefault(); startListening(); }
+});
+document.addEventListener("keyup", e => { if (e.key === " " && listening) finishListening(); });
+
+// ---------- hand tracking ----------
 function toScreen(p) {
   const vw = video.videoWidth, vh = video.videoHeight, sw = cv.width, sh = cv.height;
   const s = Math.max(sw / vw, sh / vh), ox = (sw - vw * s) / 2, oy = (sh - vh * s) / 2;
   return { x: p.x * vw * s + ox, y: p.y * vh * s + oy };
 }
-
 function isPointing(lm) {
-  // index extended, other three fingers curled (tip closer to wrist than their middle joint)
   const d = (a, b) => Math.hypot(lm[a].x - lm[b].x, lm[a].y - lm[b].y);
   const indexOut = d(8, 0) > d(6, 0) * 1.15;
   const curled = [12, 16, 20].filter(t => d(t, 0) < d(t - 2, 0) * 1.05).length >= 2;
   return indexOut && curled;
 }
-
 function loop() {
   cv.width = innerWidth * devicePixelRatio; cv.height = innerHeight * devicePixelRatio;
   cx.clearRect(0, 0, cv.width, cv.height);
   const now = performance.now();
-  if (video.readyState >= 2) {
+  if (video.readyState >= 2 && !listening) {
     const r = hands.detectForVideo(video, now);
     const lm = r.landmarks && r.landmarks[0];
     if (lm && isPointing(lm)) {
       const tip = lm[8], pip = lm[6];
       const target = { x: tip.x + (tip.x - pip.x) * REACH, y: tip.y + (tip.y - pip.y) * REACH };
       target.x = Math.min(.98, Math.max(.02, target.x)); target.y = Math.min(.98, Math.max(.02, target.y));
-      lastTarget = target;
       if (!anchor || Math.hypot(target.x - anchor.x, target.y - anchor.y) > STILL_PX) { anchor = target; holdStart = now; }
       const prog = Math.min(1, (now - holdStart) / HOLD_MS);
       drawRing(target, prog, busy);
-      if (!busy && prog >= 1 && now - lastSpoke > COOLDOWN_MS) describe(target);
-      else if (!busy && Math.floor(now / 250) !== Math.floor((now - 16) / 250) && prog < 1) tick(target.x, 660, .03, .12);
+      if (!busy && prog >= 1 && now - lastSpoke > COOLDOWN_MS) capture("point", null, target);
+      else if (!busy && prog < 1 && Math.floor(now / 250) !== Math.floor((now - 16) / 250)) tick(target.x, 660, .03, .12);
     } else { anchor = null; }
   }
   requestAnimationFrame(loop);
 }
-
 function drawRing(t, prog, isBusy) {
   const p = toScreen(t), R = 46 * devicePixelRatio;
   cx.lineWidth = 6 * devicePixelRatio;
@@ -145,25 +216,36 @@ function drawRing(t, prog, isBusy) {
   cx.beginPath(); cx.arc(p.x, p.y, R, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * prog); cx.stroke();
 }
 
-// grab the frame, draw a red ring at the target, shrink, send
-async function describe(target, fromTap) {
-  if (busy) return;
+// ---------- capture + ask the AI ----------
+const WAIT_LINE = { scene: "Looking.", read: "Reading.", ask: "Let me look." };
+
+async function capture(mode, question, target) {
+  if (busy || !video.videoWidth) return;
   busy = true; lastSpoke = performance.now(); anchor = null;
-  status("Looking", "busy"); tick(target.x, 1320, .12, .3);
-  const W = 768, H = Math.round(W * video.videoHeight / video.videoWidth);
+  status(mode === "read" ? "Reading" : "Looking", "busy");
+  tick(target ? target.x : .5, 1320, .12, .3);
+  if (WAIT_LINE[mode]) say(WAIT_LINE[mode], 1.2);
+
+  // text needs more pixels than objects do
+  const W = mode === "read" ? 1280 : 768, H = Math.round(W * video.videoHeight / video.videoWidth);
   const c = document.createElement("canvas"); c.width = W; c.height = H;
   const g = c.getContext("2d"); g.drawImage(video, 0, 0, W, H);
-  g.lineWidth = 6; g.strokeStyle = "#ff0000";
-  g.beginPath(); g.arc(target.x * W, target.y * H, W * (fromTap ? .14 : .08), 0, Math.PI * 2); g.stroke();
-  const image = c.toDataURL("image/jpeg", .7);
+  if (mode === "point") {
+    g.lineWidth = 6; g.strokeStyle = "#ff0000";
+    g.beginPath(); g.arc(target.x * W, target.y * H, W * .08, 0, Math.PI * 2); g.stroke();
+  }
+  const image = c.toDataURL("image/jpeg", mode === "read" ? .85 : .7);
   try {
-    const r = await fetch("/api/describe", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ image }) });
+    const r = await fetch("/api/describe", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ image, mode, question }) });
     const j = await r.json();
-    const text = j.text || "Sorry, I couldn't reach the describer.";
-    show(text); say(side(target.x) + text);
-  } catch (e) { show("No connection"); say("No connection. Try again."); }
+    const text = j.text || "Sorry, I couldn't get an answer.";
+    show(text, mode === "read");
+    say((mode === "point" ? side(target.x) : "") + text, mode === "read" ? 0.95 : 1.05);
+  } catch (err) { show("No connection"); say("No connection. Try again."); }
   busy = false; lastSpoke = performance.now();
-  status("Point at something", "on");
+  setTimeout(() => { $("heard").textContent = ""; }, 4000);
+  ready();
 }
 </script>
 </body>
