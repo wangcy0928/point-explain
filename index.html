@@ -98,7 +98,7 @@ $("go").onclick = async e => {
   $("start").style.display = "none";
   try {
     const stream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false });
+      video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
     video.srcObject = stream; await video.play();
   } catch (err) { status("Camera blocked"); say("I can't open the camera. Check Safari camera permission."); return; }
   status("Loading hand model", "busy");
@@ -188,29 +188,57 @@ function isPointing(lm) {
   const curled = [12, 16, 20].filter(t => d(t, 0) < d(t - 2, 0) * 1.05).length >= 2;
   return indexOut && curled;
 }
+// After describing something, stay quiet until the hand drops or points somewhere new.
+const REARM_DIST = 0.15;   // how far the target must move to describe a new thing
+const DROP_MS = 500;       // hand out of pointing pose this long = re-armed
+const DETECT_EVERY = 80;   // ms between hand detections (~12 fps keeps the phone cool)
+let armed = true, lastDescribed = null, lastPointSeen = 0, lastDetect = 0, lastTargetDrawn = null, lastProg = 0;
+
+function sizeCanvas() { cv.width = innerWidth * devicePixelRatio; cv.height = innerHeight * devicePixelRatio; }
+addEventListener("resize", sizeCanvas); sizeCanvas();
+
 function loop() {
-  cv.width = innerWidth * devicePixelRatio; cv.height = innerHeight * devicePixelRatio;
-  cx.clearRect(0, 0, cv.width, cv.height);
   const now = performance.now();
-  if (video.readyState >= 2 && !listening) {
+  // (iOS can leave .speaking stuck on, so stop trusting it after 20 s)
+  const speaking = speechSynthesis.speaking && now - lastSpoke < 20000;
+  // while asking the AI or talking, don't track the hand at all
+  if (busy || speaking || listening) {
+    anchor = null;
+    cx.clearRect(0, 0, cv.width, cv.height);
+    if (busy && lastTargetDrawn) drawRing(lastTargetDrawn, 1, true);
+    requestAnimationFrame(loop); return;
+  }
+  if (video.readyState >= 2 && now - lastDetect >= DETECT_EVERY) {
+    lastDetect = now;
+    cx.clearRect(0, 0, cv.width, cv.height);
     const r = hands.detectForVideo(video, now);
     const lm = r.landmarks && r.landmarks[0];
     if (lm && isPointing(lm)) {
+      lastPointSeen = now;
       const tip = lm[8], pip = lm[6];
       const target = { x: tip.x + (tip.x - pip.x) * REACH, y: tip.y + (tip.y - pip.y) * REACH };
       target.x = Math.min(.98, Math.max(.02, target.x)); target.y = Math.min(.98, Math.max(.02, target.y));
+      if (!armed && lastDescribed && Math.hypot(target.x - lastDescribed.x, target.y - lastDescribed.y) > REARM_DIST) armed = true;
+      if (!armed) { drawRing(target, 0, false, true); requestAnimationFrame(loop); return; }
       if (!anchor || Math.hypot(target.x - anchor.x, target.y - anchor.y) > STILL_PX) { anchor = target; holdStart = now; }
       const prog = Math.min(1, (now - holdStart) / HOLD_MS);
-      drawRing(target, prog, busy);
-      if (!busy && prog >= 1 && now - lastSpoke > COOLDOWN_MS) capture("point", null, target);
-      else if (!busy && prog < 1 && Math.floor(now / 250) !== Math.floor((now - 16) / 250)) tick(target.x, 660, .03, .12);
-    } else { anchor = null; }
+      drawRing(target, prog, false); lastTargetDrawn = target;
+      if (prog >= 1 && now - lastSpoke > COOLDOWN_MS) capture("point", null, target);
+      else if (prog < 1 && Math.floor(prog * 4) !== Math.floor(lastProg * 4)) tick(target.x, 660, .03, .12);
+      lastProg = prog;
+    } else {
+      anchor = null; lastProg = 0;
+      if (!armed && now - lastPointSeen > DROP_MS) armed = true;
+    }
   }
   requestAnimationFrame(loop);
 }
-function drawRing(t, prog, isBusy) {
+function drawRing(t, prog, isBusy, isDone) {
   const p = toScreen(t), R = 46 * devicePixelRatio;
   cx.lineWidth = 6 * devicePixelRatio;
+  // done = already described; dashed grey until the hand moves on
+  if (isDone) { cx.setLineDash([8 * devicePixelRatio, 10 * devicePixelRatio]); cx.strokeStyle = "rgba(255,255,255,.35)";
+    cx.beginPath(); cx.arc(p.x, p.y, R, 0, Math.PI * 2); cx.stroke(); cx.setLineDash([]); return; }
   cx.strokeStyle = "rgba(255,255,255,.5)"; cx.beginPath(); cx.arc(p.x, p.y, R, 0, Math.PI * 2); cx.stroke();
   cx.strokeStyle = isBusy ? "#ffb000" : "#ff3b30";
   cx.beginPath(); cx.arc(p.x, p.y, R, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * prog); cx.stroke();
@@ -222,6 +250,7 @@ const WAIT_LINE = { scene: "Looking.", read: "Reading.", ask: "Let me look." };
 async function capture(mode, question, target) {
   if (busy || !video.videoWidth) return;
   busy = true; lastSpoke = performance.now(); anchor = null;
+  if (mode === "point") { armed = false; lastDescribed = target; }
   status(mode === "read" ? "Reading" : "Looking", "busy");
   tick(target ? target.x : .5, 1320, .12, .3);
   if (WAIT_LINE[mode]) say(WAIT_LINE[mode], 1.2);
